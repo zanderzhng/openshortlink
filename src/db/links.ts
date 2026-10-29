@@ -10,6 +10,23 @@
 import type { Link, Env } from '../types';
 import { generateId } from '../utils/id';
 
+/**
+ * Thrown by createLink when the INSERT violates UNIQUE(domain_id, slug).
+ * The check-then-insert slug flow has a race window; callers catch this to
+ * return a clean 409 Conflict instead of leaking a raw 500.
+ */
+export class SlugConflictError extends Error {
+  constructor(message = 'Slug already exists') {
+    super(message);
+    this.name = 'SlugConflictError';
+  }
+}
+
+function isUniqueConstraintError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /UNIQUE constraint failed/i.test(msg);
+}
+
 export async function getLinkBySlug(
   env: Env,
   domainId: string,
@@ -35,85 +52,90 @@ export async function getLinkByIdIncludingDeleted(env: Env, linkId: string): Pro
   return result || null;
 }
 
-export async function createLink(env: Env, link: Omit<Link, 'id' | 'created_at' | 'updated_at'>): Promise<Link> {
+/** Slug lookup that also matches soft-deleted links (for import/bulk conflict handling). */
+export async function getLinkBySlugIncludingDeleted(
+  env: Env,
+  domainId: string,
+  slug: string
+): Promise<Link | null> {
+  const result = await env.DB.prepare(`SELECT * FROM links WHERE domain_id = ? AND slug = ?`)
+    .bind(domainId, slug)
+    .first<Link>();
+  return result || null;
+}
+
+/**
+ * Builds (does not execute) the INSERT for a new link. Returns the statement plus the row
+ * it will persist (id/timestamps generated here), so callers can batch it atomically.
+ */
+export function buildLinkInsertStatement(
+  env: Env,
+  link: Omit<Link, 'id' | 'created_at' | 'updated_at'>
+): { statement: D1PreparedStatement; row: Link } {
   const id = generateId('link');
   const now = Date.now();
-
-  // Try using RETURNING clause (SQLite 3.35.0+ / D1 supports it)
-  try {
-    const result = await env.DB.prepare(
-      `INSERT INTO links (
-        id, domain_id, slug, destination_url, title, description, redirect_code,
-        status, expires_at, password_hash, metadata, category_id, click_count, unique_visitors,
-        created_at, updated_at, created_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      RETURNING *`
-    )
-      .bind(
-        id,
-        link.domain_id,
-        link.slug,
-        link.destination_url,
-        link.title || null,
-        link.description || null,
-        link.redirect_code,
-        link.status,
-        link.expires_at || null,
-        link.password_hash || null,
-        link.metadata || null,
-        link.category_id || null, // Use category_id column
-        link.click_count || 0,
-        link.unique_visitors || 0,
-        now,
-        now,
-        link.created_by || null
-      )
-      .first<Link>();
-
-    if (result) {
-      return result;
-    }
-  } catch {
-    // RETURNING not supported, fall back to SELECT
-  }
-
-  // Fallback: Use SELECT (only if RETURNING not available)
-  await env.DB.prepare(
+  const statement = env.DB.prepare(
     `INSERT INTO links (
       id, domain_id, slug, destination_url, title, description, redirect_code,
       status, expires_at, password_hash, metadata, category_id, click_count, unique_visitors,
       created_at, updated_at, created_by
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      id,
-      link.domain_id,
-      link.slug,
-      link.destination_url,
-      link.title || null,
-      link.description || null,
-      link.redirect_code,
-      link.status,
-      link.expires_at || null,
-      link.password_hash || null,
-      link.metadata || null,
-      link.category_id || null, // Use category_id column
-      link.click_count || 0,
-      link.unique_visitors || 0,
-      now,
-      now,
-      link.created_by || null
-    )
-    .run();
-
-  return getLinkById(env, id) as Promise<Link>;
+  ).bind(
+    id,
+    link.domain_id,
+    link.slug,
+    link.destination_url,
+    link.title || null,
+    link.description || null,
+    link.redirect_code,
+    link.status,
+    link.expires_at || null,
+    link.password_hash || null,
+    link.metadata || null,
+    link.category_id || null,
+    link.click_count || 0,
+    link.unique_visitors || 0,
+    now,
+    now,
+    link.created_by || null
+  );
+  const row = {
+    ...link,
+    id,
+    title: link.title || null,
+    description: link.description || null,
+    expires_at: link.expires_at || null,
+    password_hash: link.password_hash || null,
+    metadata: link.metadata || null,
+    category_id: link.category_id || null,
+    click_count: link.click_count || 0,
+    unique_visitors: link.unique_visitors || 0,
+    created_by: link.created_by || null,
+    created_at: now,
+    updated_at: now,
+  } as unknown as Link;
+  return { statement, row };
 }
 
-export async function updateLink(
+export async function createLink(env: Env, link: Omit<Link, 'id' | 'created_at' | 'updated_at'>): Promise<Link> {
+  const { statement, row } = buildLinkInsertStatement(env, link);
+  try {
+    await statement.run();
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      throw new SlugConflictError();
+    }
+    throw err;
+  }
+  return (await getLinkById(env, row.id)) as Link;
+}
+
+/** Builds (does not execute) a partial UPDATE for a link; same field handling as updateLink. */
+export function buildLinkUpdateStatement(
   env: Env,
   linkId: string,
   updates: Partial<Omit<Link, 'id' | 'created_at' | 'domain_id' | 'slug'>>
-): Promise<Link | null> {
+): D1PreparedStatement {
   const fields: string[] = [];
   const values: unknown[] = [];
 
@@ -146,7 +168,6 @@ export async function updateLink(
     values.push(updates.metadata);
   }
   if (updates.category_id !== undefined) {
-    // Update category_id column
     fields.push('category_id = ?');
     values.push(updates.category_id);
   }
@@ -155,15 +176,34 @@ export async function updateLink(
   values.push(Date.now());
   values.push(linkId);
 
-  await env.DB.prepare(`UPDATE links SET ${fields.join(', ')} WHERE id = ?`).bind(...values).run();
+  return env.DB.prepare(`UPDATE links SET ${fields.join(', ')} WHERE id = ?`).bind(...values);
+}
 
+export async function updateLink(
+  env: Env,
+  linkId: string,
+  updates: Partial<Omit<Link, 'id' | 'created_at' | 'domain_id' | 'slug'>>
+): Promise<Link | null> {
+  await buildLinkUpdateStatement(env, linkId, updates).run();
   return getLinkById(env, linkId);
 }
 
 export async function deleteLink(env: Env, linkId: string, hardDelete = false): Promise<boolean> {
   if (hardDelete) {
-    const result = await env.DB.prepare(`DELETE FROM links WHERE id = ?`).bind(linkId).run();
-    return result.success;
+    // The six analytics_* tables have FOREIGN KEY(link_id) WITHOUT ON DELETE CASCADE,
+    // so a bare `DELETE FROM links` FK-violates for any link with aggregated analytics.
+    // Explicitly clear those rows first, then delete the link — all in one batch so it's atomic.
+    const batchResults = await env.DB.batch([
+      env.DB.prepare(`DELETE FROM analytics_daily WHERE link_id = ?`).bind(linkId),
+      env.DB.prepare(`DELETE FROM analytics_geo WHERE link_id = ?`).bind(linkId),
+      env.DB.prepare(`DELETE FROM analytics_referrers WHERE link_id = ?`).bind(linkId),
+      env.DB.prepare(`DELETE FROM analytics_devices WHERE link_id = ?`).bind(linkId),
+      env.DB.prepare(`DELETE FROM analytics_utm WHERE link_id = ?`).bind(linkId),
+      env.DB.prepare(`DELETE FROM analytics_custom_params WHERE link_id = ?`).bind(linkId),
+      env.DB.prepare(`DELETE FROM links WHERE id = ?`).bind(linkId),
+    ]);
+    // The links delete is the last statement in the batch.
+    return batchResults[batchResults.length - 1]?.success ?? false;
   } else {
     const result = await env.DB.prepare(`UPDATE links SET status = 'deleted' WHERE id = ?`)
       .bind(linkId)
@@ -190,9 +230,9 @@ export async function listLinks(
   }
 
   let query = `
-    SELECT l.*, d.domain_name
-    FROM links l 
-    JOIN domains d ON l.domain_id = d.id 
+    SELECT l.*, d.domain_name, d.routing_path
+    FROM links l
+    JOIN domains d ON l.domain_id = d.id
     WHERE l.status != ? AND d.status = 'active'
   `;
   const params: unknown[] = ['deleted'];
@@ -304,6 +344,12 @@ export async function updateUniqueVisitors(env: Env, linkId: string, uniqueVisit
 }
 
 /**
+ * Upper bound on how many link IDs getFilteredLinkIds will return in one call.
+ * Prevents an unbounded SELECT from materializing every id on huge tenants.
+ */
+const MAX_FILTERED_LINK_IDS = 10000;
+
+/**
  * Get link IDs filtered by domains, tags, and categories
  * Used for analytics filtering
  */
@@ -364,6 +410,12 @@ export async function getFilteredLinkIds(
     params.push(...options.categoryIds);
   }
 
+  // Defensive cap: this materializes every matching id into memory (each id then
+  // drives downstream AE queries), so bound it to avoid unbounded fan-out on a
+  // tenant with tens of thousands of links.
+  query += ' LIMIT ?';
+  params.push(MAX_FILTERED_LINK_IDS);
+
   const result = await env.DB.prepare(query).bind(...params).all<{ id: string }>();
   return (result.results || []).map(row => row.id);
 }
@@ -402,7 +454,7 @@ export async function listLinksWithTagFilter(
 
   // Build query with JOINs for database-level filtering
   let query = `
-    SELECT DISTINCT l.*, d.domain_name
+    SELECT DISTINCT l.*, d.domain_name, d.routing_path
     FROM links l
     JOIN domains d ON l.domain_id = d.id
   `;
@@ -580,17 +632,29 @@ export async function getLinksByStatusCode(
   statusCode: number,
   options: {
     domainId?: string;
+    domainIds?: string[]; // Constrain to caller's accessible domains (tenant isolation)
     destinationUrl?: string;
     limit?: number;
     offset?: number;
   } = {}
 ): Promise<{ links: Link[]; total: number }> {
+  // Caller has no accessible domains → return nothing.
+  if (options.domainIds && options.domainIds.length === 0) {
+    return { links: [], total: 0 };
+  }
+
   let query = `
     SELECT l.*, l.last_status_code, l.last_status_check_at
     FROM links l
     WHERE l.status != 'deleted' AND l.last_status_code = ?
   `;
   const params: unknown[] = [statusCode];
+
+  if (options.domainIds && options.domainIds.length > 0) {
+    const placeholders = options.domainIds.map(() => '?').join(',');
+    query += ` AND l.domain_id IN (${placeholders})`;
+    params.push(...options.domainIds);
+  }
 
   if (options.domainId) {
     query += ' AND l.domain_id = ?';
@@ -629,18 +693,31 @@ export async function getLinksByDestinationUrl(
   env: Env,
   destinationUrl: string,
   options: {
+    domainIds?: string[]; // Constrain to caller's accessible domains (tenant isolation)
     limit?: number;
     offset?: number;
   } = {}
 ): Promise<Link[]> {
+  // Caller has no accessible domains → return nothing.
+  if (options.domainIds && options.domainIds.length === 0) {
+    return [];
+  }
+
   let query = `
-    SELECT l.*, l.last_status_code, l.last_status_check_at, d.domain_name
+    SELECT l.*, l.last_status_code, l.last_status_check_at, d.domain_name, d.routing_path
     FROM links l
     JOIN domains d ON l.domain_id = d.id
     WHERE l.status != 'deleted' AND l.destination_url = ?
-    ORDER BY l.created_at DESC
   `;
   const params: unknown[] = [destinationUrl];
+
+  if (options.domainIds && options.domainIds.length > 0) {
+    const placeholders = options.domainIds.map(() => '?').join(',');
+    query += ` AND l.domain_id IN (${placeholders})`;
+    params.push(...options.domainIds);
+  }
+
+  query += ' ORDER BY l.created_at DESC';
 
   if (options.limit) {
     query += ' LIMIT ?';
@@ -660,6 +737,7 @@ export async function getLinksGroupedByDestination(
   env: Env,
   options: {
     domainId?: string;
+    domainIds?: string[]; // Constrain to caller's accessible domains (tenant isolation)
     statusCode?: number;
     search?: string;
     limit?: number;
@@ -674,9 +752,20 @@ export async function getLinksGroupedByDestination(
     link_ids: string[];
   }>; total: number
 }> {
+  // Caller has no accessible domains → return nothing.
+  if (options.domainIds && options.domainIds.length === 0) {
+    return { destinations: [], total: 0 };
+  }
+
   // Build WHERE clause
   let whereClause = 'WHERE l.status != \'deleted\'';
   const params: unknown[] = [];
+
+  if (options.domainIds && options.domainIds.length > 0) {
+    const placeholders = options.domainIds.map(() => '?').join(',');
+    whereClause += ` AND l.domain_id IN (${placeholders})`;
+    params.push(...options.domainIds);
+  }
 
   if (options.domainId) {
     whereClause += ' AND l.domain_id = ?';
@@ -752,13 +841,28 @@ export async function getLinksGroupedByDestination(
 }
 
 // Get status summary (count by status code)
-export async function getStatusSummary(env: Env, domainId?: string): Promise<Record<string, number>> {
+export async function getStatusSummary(
+  env: Env,
+  domainId?: string,
+  domainIds?: string[] // Constrain to caller's accessible domains (tenant isolation)
+): Promise<Record<string, number>> {
+  // Caller has no accessible domains → empty summary.
+  if (domainIds && domainIds.length === 0) {
+    return {};
+  }
+
   let query = `
     SELECT last_status_code, COUNT(*) as count
     FROM links
     WHERE status != 'deleted' AND last_status_code IS NOT NULL
   `;
   const params: unknown[] = [];
+
+  if (domainIds && domainIds.length > 0) {
+    const placeholders = domainIds.map(() => '?').join(',');
+    query += ` AND domain_id IN (${placeholders})`;
+    params.push(...domainIds);
+  }
 
   if (domainId) {
     query += ' AND domain_id = ?';

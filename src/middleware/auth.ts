@@ -212,8 +212,41 @@ export async function authMiddleware(c: Context<{ Bindings: Env; Variables: Vari
     accessible_domain_ids: accessibleDomainIds,
   });
   c.set('session', session);
-  
+
+  // #11: if a forced password change is pending, block everything except the
+  // endpoints needed to complete it (change-password) or read identity / sign out.
+  enforcePasswordChangePending(c, user);
+
   await next();
+}
+
+// #11: pure decision for the forced-password-change guard. Returns true when the
+// request must be blocked: the user has the flag set AND the path is not one of the
+// endpoints needed to complete the change (change-password) or read identity / sign
+// out. Extracted as a pure function so it can be unit-tested without a Hono Context.
+export function shouldBlockForPasswordChange(
+  path: string,
+  mustChangePassword: number | undefined
+): boolean {
+  if (mustChangePassword !== 1) return false;
+  // Exact-path allowlist (both /api/v1/... and /dashboard/api/v1/... mounts), not a
+  // suffix check — endsWith() would let any route ending in these names slip through.
+  const normalized = path.replace(/\/+$/, '');
+  const allowed = /^\/(?:dashboard\/)?api\/v1\/auth\/(?:change-password|me|logout)$/.test(normalized);
+  return !allowed;
+}
+
+// #11: shared guard for session-authenticated requests. Applies to session auth only
+// (API-key access is a separate credential and is intentionally not blocked).
+function enforcePasswordChangePending(
+  c: Context<{ Bindings: Env; Variables: Variables }>,
+  user: { must_change_password?: number }
+): void {
+  if (shouldBlockForPasswordChange(c.req.path, user.must_change_password)) {
+    throw new HTTPException(403, {
+      message: 'PASSWORD_CHANGE_REQUIRED: You must change your password before continuing.',
+    });
+  }
 }
 
 export async function optionalAuth(c: Context<{ Bindings: Env; Variables: Variables }>, next: Next) {
@@ -276,6 +309,9 @@ export async function optionalAuth(c: Context<{ Bindings: Env; Variables: Variab
           global_access: hasGlobalAccess,
           accessible_domain_ids: accessibleDomainIds,
         });
+        // #11: a flagged session must not perform privileged actions on optionalAuth
+        // routes either (e.g. /auth/register creating users) until it changes its password.
+        enforcePasswordChangePending(c, user);
         c.set('session', session);
       }
     }
@@ -437,12 +473,15 @@ export async function authOrApiKeyMiddleware(c: Context<{ Bindings: Env; Variabl
           role: user.role,
         });
         c.set('session', session);
+        // #11: enforce forced password change for session auth here too (this
+        // middleware guards most resource routes, e.g. /links).
+        enforcePasswordChangePending(c, user);
         await next();
         return;
       }
     }
   }
-  
+
   // Fall back to API key auth
   await apiKeyMiddleware(c, next);
 }

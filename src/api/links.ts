@@ -20,6 +20,7 @@ import {
   countLinks,
   checkSlugExists,
   listLinksWithTagFilter,
+  SlugConflictError,
 } from '../db/links';
 import { getLinkTags, setLinkTags, getLinksTagsBatch } from '../db/tags';
 import { getCategoryById, getLinksCategoriesBatch } from '../db/categories';
@@ -27,13 +28,29 @@ import { getDomainById } from '../db/domains';
 import {
   getGeoRedirects,
   getDeviceRedirects,
+  getCityRedirects,
+  getOsRedirects,
   upsertGeoRedirect,
   upsertDeviceRedirect,
+  upsertCityRedirect,
+  upsertOsRedirect,
   clearAllGeoRedirects,
   clearAllDeviceRedirects,
+  clearAllCityRedirects,
+  clearAllOsRedirects,
   getLinksGeoRedirectsBatch,
   getLinksDeviceRedirectsBatch,
+  getLinksCityRedirectsBatch,
+  getLinksOsRedirectsBatch,
+  saveLinkRedirects,
+  type RedirectData,
 } from '../db/linkRedirects';
+import { getOgMeta, upsertOgMeta } from '../db/linkOgMeta';
+import { getLinkPixels } from '../db/linkPixels';
+import { fetchOgTags, isPubliclyFetchableUrl } from '../utils/ogScraper';
+import { buildCachedLink, saveLinkExtras } from '../services/linkService';
+import { resolveLinkPixelIds, PixelError } from '../services/pixelLibrary';
+import { parseBulkRequest, runBulk } from '../services/bulkLinks';
 import { generateId, generateSlug } from '../utils/id';
 import { isValidUrl, isValidSlug, normalizeUrl, sanitizeHtml, sanitizeSearchInput, validateNumericBoundary, isReservedSlug } from '../utils/validation';
 import { detectCountryCode, getCountryName } from '../utils/countryMappings';
@@ -43,11 +60,56 @@ import { deleteCachedLink, setCachedLink } from '../services/cache';
 import { requireLinkAccess, requirePermission } from '../middleware/authorization';
 import { canAccessDomain } from '../utils/permissions';
 import { isInfiniteRedirect } from '../utils/domains';
-import { createLinkSchema, updateLinkSchema } from '../schemas';
+import { getEffectiveLinkRoute } from '../utils/route';
+import { createLinkSchema, updateLinkSchema, ogFetchSchema } from '../schemas';
 
 const linksRouter = new Hono<{ Bindings: Env }>();
 
+/** Translate pixel-library rule violations into HTTP errors. */
+function rethrowPixelError(error: unknown): never {
+  if (error instanceof PixelError) throw new HTTPException(error.status as 400, { message: error.message });
+  throw error;
+}
+
 // Schemas imported from ../schemas
+
+/**
+ * Derive the accessible-domain constraint for the status-monitor read endpoints
+ * (which are session-only via authMiddleware), mirroring GET /links.
+ *
+ * Returns:
+ *  - `undefined` for global-access users → no domain constraint (see all).
+ *  - a (possibly empty) array of domain IDs otherwise → constrain queries to these.
+ *
+ * If the caller supplies an explicit `domain_id` they cannot access, throws 403.
+ */
+async function resolveAccessibleDomainConstraint(
+  c: any,
+  explicitDomainId?: string
+): Promise<string[] | undefined> {
+  const user = c.get?.('user') as User | undefined;
+
+  // authMiddleware guarantees a user; if somehow absent, deny by default.
+  if (!user) {
+    return [];
+  }
+
+  const hasGlobalAccess = user.global_access || user.role === 'admin' || user.role === 'owner';
+
+  // Reject an explicit domain_id the user cannot access.
+  if (explicitDomainId && !hasGlobalAccess) {
+    const ok = await canAccessDomain(c.env, user, explicitDomainId);
+    if (!ok) {
+      throw new HTTPException(403, { message: 'Access denied. You do not have access to this domain.' });
+    }
+  }
+
+  if (hasGlobalAccess) {
+    return undefined;
+  }
+
+  return ((user as any).accessible_domain_ids as string[] | undefined) ?? [];
+}
 
 // List links
 linksRouter.get('/', authOrApiKeyMiddleware, async (c) => {
@@ -210,6 +272,8 @@ linksRouter.get('/', authOrApiKeyMiddleware, async (c) => {
     if (includeRedirects && linkIds.length > 0) {
       promises.push(getLinksGeoRedirectsBatch(c.env, linkIds));
       promises.push(getLinksDeviceRedirectsBatch(c.env, linkIds));
+      promises.push(getLinksCityRedirectsBatch(c.env, linkIds));
+      promises.push(getLinksOsRedirectsBatch(c.env, linkIds));
     }
 
     const results = await Promise.all(promises);
@@ -219,6 +283,8 @@ linksRouter.get('/', authOrApiKeyMiddleware, async (c) => {
     // Extract maps if they exist (based on whether we requested them)
     const geoRedirectsMap = includeRedirects ? results[2] : new Map();
     const deviceRedirectsMap = includeRedirects ? results[3] : new Map();
+    const cityRedirectsMap = includeRedirects ? results[4] : new Map();
+    const osRedirectsMap = includeRedirects ? results[5] : new Map();
 
     // Map results
     const linksWithTags = links.map(link => ({
@@ -227,6 +293,8 @@ linksRouter.get('/', authOrApiKeyMiddleware, async (c) => {
       category: categoriesMap.get(link.id),
       geo_redirects: geoRedirectsMap.get(link.id) || [],
       device_redirects: deviceRedirectsMap.get(link.id) || [],
+      city_redirects: cityRedirectsMap.get(link.id) || [],
+      os_redirects: osRedirectsMap.get(link.id) || [],
     }));
 
     return c.json({
@@ -283,8 +351,12 @@ linksRouter.get('/grouped-by-destination', authMiddleware, async (c) => {
     const offset = offsetParam ? Math.max(parseInt(offsetParam) || 0, 0) : 0;
     const statusCode = statusCodeParam ? parseInt(statusCodeParam) : undefined;
 
+    // Constrain to the caller's accessible domains (reject inaccessible explicit domain_id).
+    const accessibleDomainIds = await resolveAccessibleDomainConstraint(c, domainId || undefined);
+
     const { getLinksGroupedByDestination } = await import('../db/links');
     const { destinations, total } = await getLinksGroupedByDestination(c.env, {
+      domainIds: accessibleDomainIds,
       domainId: domainId || undefined,
       statusCode,
       search: search || undefined,
@@ -304,6 +376,10 @@ linksRouter.get('/grouped-by-destination', authMiddleware, async (c) => {
       },
     });
   } catch (error: any) {
+    // Preserve intended client errors (e.g. 403 for an inaccessible domain_id).
+    if (error instanceof HTTPException) {
+      throw error;
+    }
     console.error('Error in grouped-by-destination endpoint:', error);
     throw new HTTPException(500, {
       message: error.message || 'Failed to fetch grouped destinations'
@@ -337,8 +413,12 @@ linksRouter.get('/by-destination', authMiddleware, async (c) => {
   }
   const offset = offsetParam ? Math.max(parseInt(offsetParam) || 0, 0) : 0;
 
+  // Constrain to the caller's accessible domains (tenant isolation).
+  const accessibleDomainIds = await resolveAccessibleDomainConstraint(c);
+
   const { getLinksByDestinationUrl } = await import('../db/links');
   const links = await getLinksByDestinationUrl(c.env, normalizedUrl, {
+    domainIds: accessibleDomainIds,
     limit,
     offset,
   });
@@ -357,7 +437,7 @@ linksRouter.get('/by-destination', authMiddleware, async (c) => {
 
 // Get link by ID
 linksRouter.get('/:id', authOrApiKeyMiddleware, async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const link = await getLinkById(c.env, id);
 
   if (!link) {
@@ -394,9 +474,13 @@ linksRouter.get('/:id', authOrApiKeyMiddleware, async (c) => {
   }
 
   // Get geo and device redirects in parallel
-  const [geoRedirects, deviceRedirects] = await Promise.all([
+  const [geoRedirects, deviceRedirects, cityRedirects, osRedirects, ogMeta, pixels] = await Promise.all([
     getGeoRedirects(c.env, id),
-    getDeviceRedirects(c.env, id)
+    getDeviceRedirects(c.env, id),
+    getCityRedirects(c.env, id),
+    getOsRedirects(c.env, id),
+    getOgMeta(c.env, id),
+    getLinkPixels(c.env, id)
   ]);
 
   return c.json({
@@ -405,8 +489,32 @@ linksRouter.get('/:id', authOrApiKeyMiddleware, async (c) => {
       ...linkWithTags,
       geo_redirects: geoRedirects,
       device_redirects: deviceRedirects,
+      city_redirects: cityRedirects,
+      os_redirects: osRedirects,
+      og_meta: ogMeta,
+      pixels,
     },
   });
+});
+
+// Fetch Open Graph tags from a destination URL (for the "Fetch from URL" button).
+// Scrapes the URL the user entered and returns its OG/Twitter meta so the dashboard
+// can pre-fill the social preview fields. Auth-gated; SSRF-guarded.
+linksRouter.post('/og-fetch', authMiddleware, validateJson(ogFetchSchema), async (c) => {
+  const { url } = c.req.valid('json');
+
+  if (!isPubliclyFetchableUrl(url)) {
+    throw new HTTPException(400, { message: 'URL is not publicly fetchable' });
+  }
+
+  try {
+    const og = await fetchOgTags(url);
+    return c.json({ success: true, data: og });
+  } catch (error) {
+    throw new HTTPException(400, {
+      message: error instanceof Error ? error.message : 'Failed to fetch Open Graph tags',
+    });
+  }
 });
 
 // Create link
@@ -451,12 +559,16 @@ linksRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links'),
     throw new HTTPException(400, { message: 'Cannot create links for inactive domain. Please activate the domain first.' });
   }
 
-  // Validate route if provided
+  // Validate route if explicitly provided
   if (validated.route) {
     if (!domain.routes || !domain.routes.includes(validated.route)) {
       throw new HTTPException(400, { message: 'Invalid route for this domain' });
     }
   }
+
+  // Resolve the effective route: an explicit route wins, otherwise default to the
+  // domain's primary route so the link is always reachable and displays correctly.
+  const effectiveRoute = getEffectiveLinkRoute(domain, validated.route);
 
   // Check API key domain scoping (already declared above)
   if (apiKey && apiKey.domain_ids && apiKey.domain_ids.length > 0) {
@@ -513,90 +625,103 @@ linksRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links'),
 
   // Prepare metadata with route (category_id now goes in dedicated column)
   let metadata: string | undefined = undefined;
-  if (validated.metadata || validated.route) {
+  if (validated.metadata || effectiveRoute) {
     const metadataObj = validated.metadata ? { ...validated.metadata } : {};
-    if (validated.route) {
-      metadataObj.route = validated.route;
+    if (effectiveRoute) {
+      metadataObj.route = effectiveRoute;
     }
     metadata = JSON.stringify(metadataObj);
   }
 
-  // Create link
-  const link = await createLink(c.env, {
-    domain_id: validated.domain_id,
-    slug,
-    destination_url: destinationUrl,
-    title,
-    description,
-    redirect_code: validated.redirect_code,
-    status: 'active',
-    expires_at: validated.expires_at,
-    metadata,
-    category_id: validated.category_id, // Use dedicated column
-    click_count: 0,
-    unique_visitors: 0,
-  });
+  // Resolve retargeting pixels BEFORE creating the link so a cross-domain id fails cleanly.
+  // Omitted -> the domain's default pixels.
+  const pixelIds = await resolveLinkPixelIds(c.env, validated.domain_id, validated.pixel_ids, { applyDefaults: true })
+    .catch(rethrowPixelError);
+
+  // Create link. Translate a UNIQUE(domain_id, slug) race (check-then-insert window)
+  // into a clean 409 Conflict instead of a raw 500.
+  let link: Link;
+  try {
+    link = await createLink(c.env, {
+      domain_id: validated.domain_id,
+      slug,
+      destination_url: destinationUrl,
+      title,
+      description,
+      redirect_code: validated.redirect_code,
+      status: 'active',
+      expires_at: validated.expires_at,
+      metadata,
+      category_id: validated.category_id, // Use dedicated column
+      click_count: 0,
+      unique_visitors: 0,
+    });
+  } catch (error) {
+    if (error instanceof SlugConflictError) {
+      throw new HTTPException(409, { message: 'Slug already exists' });
+    }
+    throw error;
+  }
 
   // Set tags if provided
   if (validated.tags && validated.tags.length > 0) {
     await setLinkTags(c.env, link.id, validated.tags);
   }
 
-  // Save geo redirects
-  if (validated.geo_redirects && validated.geo_redirects.length > 0) {
-    for (const geo of validated.geo_redirects) {
-      await upsertGeoRedirect(c.env, link.id, geo.country_code, geo.destination_url);
-    }
+  // Save all redirects
+  await saveLinkRedirects(c.env, link.id, {
+    geo_redirects: validated.geo_redirects,
+    device_redirects: validated.device_redirects,
+    city_redirects: validated.city_redirects,
+    os_redirects: validated.os_redirects,
+  });
+
+  // Save Open Graph / Twitter Card metadata only when it carries a real preview
+  // field. og_meta:{} still validates (og_type/twitter_card default), so guard on
+  // title/description/image — matching the PUT path — to avoid a meaningless row
+  // that would route bots to an empty preview page.
+  if (validated.og_meta && (validated.og_meta.og_title || validated.og_meta.og_description || validated.og_meta.og_image)) {
+    await upsertOgMeta(c.env, link.id, validated.og_meta);
   }
 
-  // Save device redirects
-  if (validated.device_redirects && validated.device_redirects.length > 0) {
-    for (const device of validated.device_redirects) {
-      await upsertDeviceRedirect(c.env, link.id, device.device_type, device.destination_url);
-    }
+  // Attach library pixels (explicit list or the domain's defaults)
+  if (pixelIds && pixelIds.length > 0) {
+    await saveLinkExtras(c.env, link.id, { pixel_ids: pixelIds });
   }
 
-  // Build cache with redirects
-  const geoRedirects = await getGeoRedirects(c.env, link.id);
-  const deviceRedirects = await getDeviceRedirects(c.env, link.id);
-
-  const cachedLink = {
-    destination_url: link.destination_url,
-    redirect_code: link.redirect_code,
-    status: link.status,
-    expires_at: link.expires_at,
-    password_hash: link.password_hash,
-    link_id: link.id, // Include link_id in cache for tracking
-    geo_redirects:
-      geoRedirects.length > 0
-        ? Object.fromEntries(geoRedirects.map((r) => [r.country_code, r.destination_url]))
-        : undefined,
-    device_redirects:
-      deviceRedirects.length > 0
-        ? {
-          desktop: deviceRedirects.find((r) => r.device_type === 'desktop')?.destination_url,
-          mobile: deviceRedirects.find((r) => r.device_type === 'mobile')?.destination_url,
-          tablet: deviceRedirects.find((r) => r.device_type === 'tablet')?.destination_url,
-        }
-        : undefined,
-    route: link.metadata ? (() => {
-      try { return JSON.parse(link.metadata).route; } catch { return undefined; }
-    })() : undefined,
-    domain_routing_path: domain.routing_path,
-  };
-
+  // Build and set cache
+  const cachedLink = await buildCachedLink(c.env, link, domain);
   await setCachedLink(c.env, domain.domain_name, link.slug, cachedLink);
+
+  // Fetch fresh data for response
+  const [geoRedirects, deviceRedirects, cityRedirects, osRedirects, ogMeta, pixels] = await Promise.all([
+    getGeoRedirects(c.env, link.id),
+    getDeviceRedirects(c.env, link.id),
+    getCityRedirects(c.env, link.id),
+    getOsRedirects(c.env, link.id),
+    getOgMeta(c.env, link.id),
+    getLinkPixels(c.env, link.id),
+  ]);
 
   // Get link with tags
   const tags = await getLinkTags(c.env, link.id);
-  const linkWithTags = { ...link, tags, geo_redirects: geoRedirects, device_redirects: deviceRedirects };
+  const linkWithTags = {
+    ...link,
+    tags,
+    geo_redirects: geoRedirects,
+    device_redirects: deviceRedirects,
+    city_redirects: cityRedirects,
+    os_redirects: osRedirects,
+    og_meta: ogMeta,
+    pixels,
+  };
 
   return c.json({ success: true, data: linkWithTags }, 201);
 });
 
 // Update link
 linksRouter.put('/:id', authOrApiKeyMiddleware, requireLinkAccess('edit'), validateJson(updateLinkSchema), async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const validated = c.req.valid('json');
 
   // Use getLinkByIdIncludingDeleted to allow restoring deleted links
@@ -684,6 +809,10 @@ linksRouter.put('/:id', authOrApiKeyMiddleware, requireLinkAccess('edit'), valid
     updates.metadata = JSON.stringify({ ...currentMetadata, ...validated.metadata });
   }
 
+  // Validate pixel ids against the link's own domain before writing anything.
+  const pixelIds = await resolveLinkPixelIds(c.env, existingLink.domain_id, validated.pixel_ids, { applyDefaults: false })
+    .catch(rethrowPixelError);
+
   await updateLink(c.env, id, updates);
 
   // Update tags if provided
@@ -695,18 +824,30 @@ linksRouter.put('/:id', authOrApiKeyMiddleware, requireLinkAccess('edit'), valid
   if (validated.geo_redirects !== undefined) {
     // Clear existing and add new
     await clearAllGeoRedirects(c.env, id);
-    for (const geo of validated.geo_redirects) {
-      await upsertGeoRedirect(c.env, id, geo.country_code, geo.destination_url);
-    }
+    await saveLinkRedirects(c.env, id, { geo_redirects: validated.geo_redirects });
   }
 
   // Update device redirects if provided
   if (validated.device_redirects !== undefined) {
     await clearAllDeviceRedirects(c.env, id);
-    for (const device of validated.device_redirects) {
-      await upsertDeviceRedirect(c.env, id, device.device_type, device.destination_url);
-    }
+    await saveLinkRedirects(c.env, id, { device_redirects: validated.device_redirects });
   }
+
+  // Update city redirects if provided
+  if (validated.city_redirects !== undefined) {
+    await clearAllCityRedirects(c.env, id);
+    await saveLinkRedirects(c.env, id, { city_redirects: validated.city_redirects });
+  }
+
+  // Update os redirects if provided
+  if (validated.os_redirects !== undefined) {
+    await clearAllOsRedirects(c.env, id);
+    await saveLinkRedirects(c.env, id, { os_redirects: validated.os_redirects });
+  }
+
+  // Update Open Graph metadata and retargeting pixels if provided (an empty og_meta or
+  // an empty pixel_ids array removes them).
+  await saveLinkExtras(c.env, id, { og_meta: validated.og_meta, pixel_ids: pixelIds });
 
   // Get updated link with tags and category
   const updatedLink = await getLinkById(c.env, id);
@@ -720,49 +861,48 @@ linksRouter.put('/:id', authOrApiKeyMiddleware, requireLinkAccess('edit'), valid
     category = await getCategoryById(c.env, updatedLink.category_id);
   }
 
-  // Get redirects
-  const geoRedirects = await getGeoRedirects(c.env, id);
-  const deviceRedirects = await getDeviceRedirects(c.env, id);
-
-  // Rebuild cache with updated data (same structure as create)
+  // Rebuild cache with updated data. If the link is no longer active
+  // (archived/expired/deleted/inactive), DELETE the cache entry instead of
+  // re-caching an active-looking one — otherwise a disabled link keeps
+  // redirecting from the cache-hit path forever.
   const domain = await getDomainById(c.env, existingLink.domain_id);
   if (domain) {
-    const cachedLink = {
-      destination_url: updatedLink.destination_url,
-      redirect_code: updatedLink.redirect_code,
-      status: updatedLink.status,
-      expires_at: updatedLink.expires_at,
-      password_hash: updatedLink.password_hash,
-      link_id: updatedLink.id, // Include link_id in cache for tracking
-      geo_redirects:
-        geoRedirects.length > 0
-          ? Object.fromEntries(geoRedirects.map((r) => [r.country_code, r.destination_url]))
-          : undefined,
-      device_redirects:
-        deviceRedirects.length > 0
-          ? {
-            desktop: deviceRedirects.find((r) => r.device_type === 'desktop')?.destination_url,
-            mobile: deviceRedirects.find((r) => r.device_type === 'mobile')?.destination_url,
-            tablet: deviceRedirects.find((r) => r.device_type === 'tablet')?.destination_url,
-          }
-          : undefined,
-      route: updatedLink.metadata ? (() => {
-        try { return JSON.parse(updatedLink.metadata).route; } catch { return undefined; }
-      })() : undefined,
-      domain_routing_path: domain.routing_path,
-    };
-
-    await setCachedLink(c.env, domain.domain_name, existingLink.slug, cachedLink);
+    if (updatedLink.status !== 'active') {
+      await deleteCachedLink(c.env, domain.domain_name, existingLink.slug);
+    } else {
+      const cachedLink = await buildCachedLink(c.env, updatedLink, domain);
+      await setCachedLink(c.env, domain.domain_name, existingLink.slug, cachedLink);
+    }
   }
 
-  const linkWithTags = { ...updatedLink, tags, category, geo_redirects: geoRedirects, device_redirects: deviceRedirects };
+  // Fetch fresh data for response
+  const [geoRedirects, deviceRedirects, cityRedirects, osRedirects, ogMeta, pixels] = await Promise.all([
+    getGeoRedirects(c.env, id),
+    getDeviceRedirects(c.env, id),
+    getCityRedirects(c.env, id),
+    getOsRedirects(c.env, id),
+    getOgMeta(c.env, id),
+    getLinkPixels(c.env, id),
+  ]);
+
+  const linkWithTags = {
+    ...updatedLink,
+    tags,
+    category,
+    geo_redirects: geoRedirects,
+    device_redirects: deviceRedirects,
+    city_redirects: cityRedirects,
+    os_redirects: osRedirects,
+    og_meta: ogMeta,
+    pixels,
+  };
 
   return c.json({ success: true, data: linkWithTags });
 });
 
 // Delete link
 linksRouter.delete('/:id', authOrApiKeyMiddleware, requireLinkAccess('delete'), async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const hardDelete = c.req.query('hard') === 'true';
 
   // Use getLinkByIdIncludingDeleted to check if link exists (including deleted ones)
@@ -800,605 +940,24 @@ linksRouter.delete('/:id', authOrApiKeyMiddleware, requireLinkAccess('delete'), 
   return c.json({ success: true, message: 'Link deleted' });
 });
 
-// Bulk operations
+// Bulk operations (logic lives in services/bulkLinks.ts)
 linksRouter.post('/bulk', authOrApiKeyMiddleware, requirePermission('edit_links'), async (c) => {
   const body = await c.req.json();
-  const { action, link_ids, updates } = body;
-
-  if (!Array.isArray(link_ids) || link_ids.length === 0) {
-    throw new HTTPException(400, { message: 'link_ids array required' });
+  const parsed = parseBulkRequest(body);
+  if (!parsed.ok) {
+    throw new HTTPException(400, { message: parsed.message });
   }
-
-  // Check API key domain scoping
   const apiKey = (c as any).get?.('apiKey') as ApiKeyContext | undefined;
-
-  const results = [];
-
-  if (action === 'delete') {
-    for (const id of link_ids) {
-      const link = await getLinkById(c.env, id);
-      if (link) {
-        // Check API key domain scoping
-        if (apiKey && apiKey.domain_ids && apiKey.domain_ids.length > 0) {
-          if (!apiKey.domain_ids.includes(link.domain_id)) {
-            results.push({ id, success: false, error: 'Domain not on scope' });
-            continue;
-          }
-        }
-
-        await deleteLink(c.env, id, false);
-        const domain = await getDomainById(c.env, link.domain_id);
-        if (domain) {
-          await deleteCachedLink(c.env, domain.domain_name, link.slug);
-        }
-        results.push({ id, success: true });
-      } else {
-        results.push({ id, success: false, error: 'Link not found' });
-      }
-    }
-  } else if (action === 'update' && updates) {
-    const validated = updateLinkSchema.partial().parse(updates);
-    // Extract tags, category_id, route, metadata, geo_redirects, and device_redirects (they're handled separately)
-    const { tags, category_id, route, metadata: metadataObj, geo_redirects, device_redirects, ...linkUpdates } = validated;
-
-    for (const id of link_ids) {
-      const link = await getLinkById(c.env, id);
-      if (link) {
-        // Check API key domain scoping
-        if (apiKey && apiKey.domain_ids && apiKey.domain_ids.length > 0) {
-          if (!apiKey.domain_ids.includes(link.domain_id)) {
-            results.push({ id, success: false, error: 'Domain not on scope' });
-            continue;
-          }
-        }
-
-        // Prepare metadata updates
-        let finalMetadata: string | undefined = undefined;
-        if (metadataObj !== undefined || category_id !== undefined) {
-          const currentMetadata = link.metadata ? JSON.parse(link.metadata) : {};
-          const updatedMetadata = metadataObj ? { ...currentMetadata, ...metadataObj } : { ...currentMetadata };
-          if (category_id !== undefined) {
-            updatedMetadata.category_id = category_id;
-          }
-          if (route !== undefined) {
-            // We should validate route against domain here, but for bulk ops we might skip strict validation or fail?
-            // Let's validate
-            const domain = await getDomainById(c.env, link.domain_id);
-            if (domain && domain.routes && domain.routes.includes(route)) {
-              updatedMetadata.route = route;
-            } else {
-              results.push({ id, success: false, error: 'Invalid route for domain' });
-              continue;
-            }
-          }
-          finalMetadata = JSON.stringify(updatedMetadata);
-        }
-
-        // Update link fields (excluding tags, category_id, metadata, and redirects which are handled separately)
-        if (Object.keys(linkUpdates).length > 0 || finalMetadata !== undefined) {
-          await updateLink(c.env, id, { ...linkUpdates, ...(finalMetadata !== undefined ? { metadata: finalMetadata } : {}) });
-        }
-
-        // Handle tags separately if provided
-        if (tags !== undefined) {
-          await setLinkTags(c.env, id, tags);
-        }
-
-        // Handle geo redirects if provided
-        if (geo_redirects !== undefined) {
-          await clearAllGeoRedirects(c.env, id);
-          for (const geo of geo_redirects) {
-            await upsertGeoRedirect(c.env, id, geo.country_code, geo.destination_url);
-          }
-        }
-
-        // Handle device redirects if provided
-        if (device_redirects !== undefined) {
-          await clearAllDeviceRedirects(c.env, id);
-          for (const device of device_redirects) {
-            await upsertDeviceRedirect(c.env, id, device.device_type, device.destination_url);
-          }
-        }
-
-        // Rebuild cache with updated data (same structure as create)
-        const domain = await getDomainById(c.env, link.domain_id);
-        if (domain) {
-          // Get updated link data
-          const updatedLink = await getLinkById(c.env, id);
-          if (updatedLink) {
-            const geoRedirects = await getGeoRedirects(c.env, id);
-            const deviceRedirects = await getDeviceRedirects(c.env, id);
-
-            const cachedLink = {
-              destination_url: updatedLink.destination_url,
-              redirect_code: updatedLink.redirect_code,
-              status: updatedLink.status,
-              expires_at: updatedLink.expires_at,
-              password_hash: updatedLink.password_hash,
-              link_id: updatedLink.id, // Include link_id in cache for tracking
-              geo_redirects:
-                geoRedirects.length > 0
-                  ? Object.fromEntries(geoRedirects.map((r) => [r.country_code, r.destination_url]))
-                  : undefined,
-              device_redirects:
-                deviceRedirects.length > 0
-                  ? {
-                    desktop: deviceRedirects.find((r) => r.device_type === 'desktop')?.destination_url,
-                    mobile: deviceRedirects.find((r) => r.device_type === 'mobile')?.destination_url,
-                    tablet: deviceRedirects.find((r) => r.device_type === 'tablet')?.destination_url,
-                  }
-                  : undefined,
-              route: updatedLink.metadata ? (() => {
-                try { return JSON.parse(updatedLink.metadata).route; } catch { return undefined; }
-              })() : undefined,
-              domain_routing_path: domain.routing_path,
-            };
-
-            await setCachedLink(c.env, domain.domain_name, link.slug, cachedLink);
-          }
-        }
-        results.push({ id, success: true });
-      } else {
-        results.push({ id, success: false, error: 'Link not found' });
-      }
-    }
-  }
-
+  const user = (c as any).get?.('user') as User | undefined;
+  const results = await runBulk(c.env, { user, apiKey }, parsed.request);
   return c.json({ success: true, data: results });
 });
-
-// Import links from CSV
-linksRouter.post('/import', authOrApiKeyMiddleware, requirePermission('create_links'), async (c) => {
-  try {
-    const formData = await c.req.formData();
-    const file = formData.get('file') as File;
-    const domainId = formData.get('domain_id') as string;
-    const columnMappingStr = formData.get('column_mapping') as string;
-    const slugPrefixFilterStr = formData.get('slug_prefix_filter') as string;
-    let delimiter = (formData.get('delimiter') as string) || ',';
-
-    // Handle tab delimiter (sent as '\t' string or actual tab character)
-    if (delimiter === '\\t' || delimiter === '\t') {
-      delimiter = '\t';
-    }
-
-    if (!file) {
-      throw new HTTPException(400, { message: 'CSV file is required' });
-    }
-
-    // Validate file size (max 5MB)
-    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-    if (file.size > MAX_FILE_SIZE) {
-      throw new HTTPException(400, {
-        message: `File too large. Maximum size is 5MB. Your file is ${(file.size / (1024 * 1024)).toFixed(2)}MB.`
-      });
-    }
-
-    if (!domainId) {
-      throw new HTTPException(400, { message: 'Domain ID is required' });
-    }
-
-    if (!columnMappingStr) {
-      throw new HTTPException(400, { message: 'Column mapping is required' });
-    }
-
-    // Validate domain exists
-    const domain = await getDomainById(c.env, domainId);
-    if (!domain) {
-      throw new HTTPException(404, { message: 'Domain not found' });
-    }
-
-    // Check API key domain scoping
-    const apiKey = (c as any).get?.('apiKey') as ApiKeyContext | undefined;
-    if (apiKey && apiKey.domain_ids && apiKey.domain_ids.length > 0) {
-      if (!apiKey.domain_ids.includes(domainId)) {
-        throw new HTTPException(403, { message: 'Domain not on scope' });
-      }
-    }
-
-    // Parse column mapping
-    let columnMapping: Record<string, string>;
-    try {
-      columnMapping = JSON.parse(columnMappingStr);
-    } catch {
-      throw new HTTPException(400, { message: 'Invalid column mapping JSON' });
-    }
-
-    // Parse slug prefix filter
-    let slugPrefixFilter: Record<string, string> = {};
-    if (slugPrefixFilterStr) {
-      try {
-        slugPrefixFilter = JSON.parse(slugPrefixFilterStr);
-      } catch {
-        // Ignore invalid prefix filter JSON
-      }
-    }
-
-    // Read and parse CSV
-    const csvText = await file.text();
-    // Handle both \r\n and \n line endings
-    const lines = csvText.split(/\r?\n/).filter(line => line.trim().length > 0);
-
-    if (lines.length < 2) {
-      throw new HTTPException(400, { message: 'CSV must have at least a header row and one data row' });
-    }
-
-    // Parse CSV header
-    const headers = parseCSVLine(lines[0], delimiter);
-
-    // Auto-detect geo and device redirect columns
-    const geoColumns: Record<string, string> = {}; // { columnName: countryCode }
-    const deviceColumns: Record<string, string> = {}; // { columnName: deviceType }
-
-    const validDeviceTypes = ['desktop', 'mobile', 'tablet'];
-    const deviceSuffixes = [' url', ' link', ' page', '_url', '_link', '_page', '-url', '-link', '-page', 'url', 'link', 'page'];
-
-    headers.forEach(header => {
-      const original = header.trim();
-      const cleanHeader = original.toLowerCase();
-
-      // Try to detect country using comprehensive detection
-      const countryCode = detectCountryCode(original);
-      if (countryCode) {
-        geoColumns[header] = countryCode;
-        return; // Skip device detection if country detected
-      }
-
-      // Check for device pattern with various suffixes
-      let withoutSuffix = cleanHeader;
-      for (const suffix of deviceSuffixes) {
-        if (cleanHeader.endsWith(suffix)) {
-          withoutSuffix = cleanHeader.slice(0, -suffix.length).trim();
-          withoutSuffix = withoutSuffix.replace(/[_-]+$/, ''); // Remove trailing separators
-          break;
-        }
-      }
-
-      // Check if it matches a device type
-      if (validDeviceTypes.includes(withoutSuffix)) {
-        deviceColumns[header] = withoutSuffix;
-      }
-    });
-
-    // Parse CSV rows
-    const rows: string[][] = [];
-    for (let i = 1; i < lines.length; i++) {
-      const row = parseCSVLine(lines[i], delimiter);
-      if (row.length > 0) {
-        rows.push(row);
-      }
-    }
-
-    if (rows.length === 0) {
-      throw new HTTPException(400, { message: 'CSV has no data rows' });
-    }
-
-    // Map columns to link fields
-    const requiredFields = ['destination_url'];
-    const results: Array<{ success: boolean; slug?: string; error?: string; row?: number }> = [];
-
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      const rowData: Record<string, string> = {};
-      const geoRedirectsData: Record<string, string> = {}; // { countryCode: url }
-      const deviceRedirectsData: Record<string, string> = {}; // { deviceType: url }
-
-      // Map CSV columns to data
-      for (const [csvColumn, linkField] of Object.entries(columnMapping)) {
-        // Try exact match first, then case-insensitive match
-        let columnIndex = headers.indexOf(csvColumn);
-        if (columnIndex === -1) {
-          // Try case-insensitive match
-          columnIndex = headers.findIndex(h => h.trim().toLowerCase() === csvColumn.trim().toLowerCase());
-        }
-        if (columnIndex !== -1 && columnIndex < row.length) {
-          let value = row[columnIndex].trim();
-
-          // Check if this is a manual device redirect mapping
-          if (linkField.startsWith('device_redirect:')) {
-            const deviceType = linkField.split(':')[1] as 'desktop' | 'mobile' | 'tablet';
-            if (value && isValidUrl(value)) {
-              deviceRedirectsData[deviceType] = normalizeUrl(value);
-            }
-            continue; // Skip adding to rowData
-          }
-
-          // Apply slug prefix filter if this is a slug field
-          if (linkField === 'slug' && slugPrefixFilter[csvColumn]) {
-            value = extractSlugFromPrefix(value, slugPrefixFilter[csvColumn]);
-          }
-
-          rowData[linkField] = value;
-        }
-      }
-
-      // Extract geo redirect URLs from detected columns
-      for (const [columnName, countryCode] of Object.entries(geoColumns)) {
-        const columnIndex = headers.indexOf(columnName);
-        if (columnIndex !== -1 && columnIndex < row.length) {
-          const url = row[columnIndex].trim();
-          if (url && isValidUrl(url)) {
-            geoRedirectsData[countryCode] = normalizeUrl(url);
-          }
-        }
-      }
-
-      // Extract device redirect URLs from detected columns
-      for (const [columnName, deviceType] of Object.entries(deviceColumns)) {
-        const columnIndex = headers.indexOf(columnName);
-        if (columnIndex !== -1 && columnIndex < row.length) {
-          const url = row[columnIndex].trim();
-          if (url && isValidUrl(url)) {
-            deviceRedirectsData[deviceType] = normalizeUrl(url);
-          }
-        }
-      }
-
-      // Validate required fields
-      if (!rowData.destination_url) {
-        results.push({ success: false, error: 'Missing destination_url', row: i + 2 });
-        continue;
-      }
-
-      // Validate URL
-      if (!isValidUrl(rowData.destination_url)) {
-        results.push({ success: false, error: 'Invalid destination_url', row: i + 2 });
-        continue;
-      }
-
-      // Prepare link data
-      const linkData: any = {
-        domain_id: domainId,
-        destination_url: normalizeUrl(rowData.destination_url),
-        redirect_code: rowData.redirect_code ? parseInt(rowData.redirect_code) || 301 : 301,
-      };
-
-      if (rowData.slug) {
-        // Validate slug if provided
-        if (!isValidSlug(rowData.slug)) {
-          results.push({ success: false, error: 'Invalid slug format', row: i + 2 });
-          continue;
-        }
-        if (await checkSlugExists(c.env, domainId, rowData.slug)) {
-          results.push({ success: false, error: 'Slug already exists', row: i + 2 });
-          continue;
-        }
-        linkData.slug = rowData.slug;
-      } else {
-        // Generate slug
-        let slug = generateSlug(8);
-        let attempts = 0;
-        while (await checkSlugExists(c.env, domainId, slug) && attempts < 10) {
-          slug = generateSlug(8);
-          attempts++;
-        }
-        if (attempts >= 10) {
-          results.push({ success: false, error: 'Failed to generate unique slug', row: i + 2 });
-          continue;
-        }
-        linkData.slug = slug;
-      }
-
-      if (rowData.title) {
-        try {
-          linkData.title = sanitizeHtml(rowData.title);
-        } catch (error) {
-          results.push({ success: false, error: 'Invalid input: failed to sanitize title', row: i + 2 });
-          continue;
-        }
-      }
-      if (rowData.description) {
-        try {
-          linkData.description = sanitizeHtml(rowData.description);
-        } catch (error) {
-          results.push({ success: false, error: 'Invalid input: failed to sanitize description', row: i + 2 });
-          continue;
-        }
-      }
-
-      // Handle category_id if provided
-      if (rowData.category_id) {
-        const category = await getCategoryById(c.env, rowData.category_id);
-        if (category) {
-          linkData.metadata = JSON.stringify({ category_id: rowData.category_id });
-        }
-      }
-
-      // Handle tags if provided (comma-separated tag names)
-      let tags: string[] = [];
-      if (rowData.tags) {
-        const tagNames = rowData.tags.split(',').map(t => t.trim()).filter(t => t.length > 0);
-        // For now, we'll skip tag creation during import - tags should be created separately
-        // This could be enhanced later to auto-create tags
-      }
-
-      // Build geo redirects array from extracted data
-      const geoRedirects: Array<{ country_code: string; destination_url: string }> = [];
-      for (const [countryCode, url] of Object.entries(geoRedirectsData)) {
-        geoRedirects.push({ country_code: countryCode, destination_url: url });
-      }
-      // Limit to 10 countries
-      if (geoRedirects.length > 10) {
-        geoRedirects.splice(10);
-      }
-
-      // Build device redirects array from extracted data
-      const deviceRedirects: Array<{ device_type: 'desktop' | 'mobile' | 'tablet'; destination_url: string }> = [];
-      for (const [deviceType, url] of Object.entries(deviceRedirectsData)) {
-        deviceRedirects.push({
-          device_type: deviceType as 'desktop' | 'mobile' | 'tablet',
-          destination_url: url
-        });
-      }
-
-      try {
-        // Create link
-        const link = await createLink(c.env, {
-          ...linkData,
-          status: 'active',
-          click_count: 0,
-          unique_visitors: 0,
-        });
-
-        // Set tags if any
-        if (tags.length > 0) {
-          await setLinkTags(c.env, link.id, tags);
-        }
-
-        // Set geo redirects if any
-        if (geoRedirects.length > 0) {
-          for (const geo of geoRedirects) {
-            await upsertGeoRedirect(c.env, link.id, geo.country_code, geo.destination_url);
-          }
-        }
-
-        // Set device redirects if any
-        if (deviceRedirects.length > 0) {
-          for (const device of deviceRedirects) {
-            await upsertDeviceRedirect(c.env, link.id, device.device_type, device.destination_url);
-          }
-        }
-
-        // Build and cache link with redirects
-        const domain = await getDomainById(c.env, domainId);
-        if (domain) {
-          const cachedGeoRedirects = await getGeoRedirects(c.env, link.id);
-          const cachedDeviceRedirects = await getDeviceRedirects(c.env, link.id);
-
-          const cachedLink = {
-            destination_url: link.destination_url,
-            redirect_code: link.redirect_code,
-            status: link.status,
-            expires_at: link.expires_at,
-            password_hash: link.password_hash,
-            link_id: link.id, // Include link_id in cache for tracking
-            geo_redirects:
-              cachedGeoRedirects.length > 0
-                ? Object.fromEntries(cachedGeoRedirects.map((r) => [r.country_code, r.destination_url]))
-                : undefined,
-            device_redirects:
-              cachedDeviceRedirects.length > 0
-                ? {
-                  desktop: cachedDeviceRedirects.find((r) => r.device_type === 'desktop')?.destination_url,
-                  mobile: cachedDeviceRedirects.find((r) => r.device_type === 'mobile')?.destination_url,
-                  tablet: cachedDeviceRedirects.find((r) => r.device_type === 'tablet')?.destination_url,
-                }
-                : undefined,
-            route: link.metadata ? (() => {
-              try { return JSON.parse(link.metadata).route; } catch { return undefined; }
-            })() : undefined,
-            domain_routing_path: domain.routing_path,
-          };
-
-          await setCachedLink(c.env, domain.domain_name, link.slug, cachedLink);
-        }
-
-        results.push({ success: true, slug: link.slug });
-      } catch (error: any) {
-        results.push({ success: false, error: error.message || 'Failed to create link', row: i + 2 });
-      }
-    }
-
-    const successCount = results.filter(r => r.success).length;
-    const errorCount = results.filter(r => !r.success).length;
-
-    return c.json({
-      success: true,
-      data: {
-        total: results.length,
-        success: successCount,
-        errors: errorCount,
-        results,
-      },
-    });
-  } catch (error: any) {
-    if (error instanceof HTTPException) {
-      throw error;
-    }
-    throw new HTTPException(500, { message: error.message || 'Failed to import CSV' });
-  }
-});
-
-// Helper function to extract slug from value using prefix filter
-// Uses string operations instead of regex to prevent ReDoS attacks
-function extractSlugFromPrefix(value: string, prefix: string): string {
-  if (!value || !prefix) return value;
-  
-  // Limit prefix length for defense in depth
-  if (prefix.length > 200) {
-    return value;
-  }
-
-  // Remove trailing slash from prefix if present
-  const cleanPrefix = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix;
-  const prefixWithSlash = cleanPrefix + '/';
-  
-  // Use case-insensitive string matching instead of regex (safer, prevents ReDoS)
-  const valueLower = value.toLowerCase();
-  const prefixWithSlashLower = prefixWithSlash.toLowerCase();
-  const cleanPrefixLower = cleanPrefix.toLowerCase();
-
-  // Try to find prefix with slash first
-  const indexWithSlash = valueLower.indexOf(prefixWithSlashLower);
-  if (indexWithSlash !== -1) {
-    // Extract from original string at the correct position
-    const afterPrefix = value.substring(indexWithSlash + prefixWithSlash.length);
-    const extracted = afterPrefix.split('/')[0].trim();
-    return extracted || value; // Return extracted, or original if somehow empty
-  }
-
-  // Try without trailing slash if prefix with slash not found
-  const indexWithoutSlash = valueLower.indexOf(cleanPrefixLower);
-  if (indexWithoutSlash !== -1) {
-    const afterPrefix = value.substring(indexWithoutSlash + cleanPrefix.length);
-    const extracted = afterPrefix.startsWith('/')
-      ? afterPrefix.substring(1).split('/')[0].trim()
-      : afterPrefix.split('/')[0].trim();
-    return extracted || value;
-  }
-
-  return value; // Return original if prefix not found
-}
-
-// Helper function to parse CSV line (handles quoted fields and custom delimiter)
-function parseCSVLine(line: string, delimiter: string = ','): string[] {
-  const result: string[] = [];
-  let current = '';
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    const nextChar = line[i + 1];
-
-    if (char === '"') {
-      if (inQuotes && nextChar === '"') {
-        // Escaped quote
-        current += '"';
-        i++; // Skip next quote
-      } else {
-        // Toggle quote state
-        inQuotes = !inQuotes;
-      }
-    } else if (char === delimiter && !inQuotes) {
-      // Field separator
-      result.push(current);
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-
-  // Add last field
-  result.push(current);
-
-  return result;
-}
 
 // Status Check Endpoints
 
 // Get links by status code
 linksRouter.get('/status/:statusCode', authMiddleware, async (c) => {
-  const statusCode = parseInt(c.req.param('statusCode'));
+  const statusCode = parseInt(c.req.param('statusCode')!);
   const domainId = c.req.query('domain_id');
   const destinationUrl = c.req.query('destination_url');
   const limitParam = c.req.query('limit');
@@ -1411,8 +970,12 @@ linksRouter.get('/status/:statusCode', authMiddleware, async (c) => {
   const limit = limitParam ? Math.min(Math.max(parseInt(limitParam) || 25, 1), 500) : 25;
   const offset = offsetParam ? Math.max(parseInt(offsetParam) || 0, 0) : 0;
 
+  // Constrain to the caller's accessible domains (reject inaccessible explicit domain_id).
+  const accessibleDomainIds = await resolveAccessibleDomainConstraint(c, domainId || undefined);
+
   const { getLinksByStatusCode, getStatusSummary } = await import('../db/links');
   const { links, total } = await getLinksByStatusCode(c.env, statusCode, {
+    domainIds: accessibleDomainIds,
     domainId: domainId || undefined,
     destinationUrl: destinationUrl || undefined,
     limit,
@@ -1420,7 +983,7 @@ linksRouter.get('/status/:statusCode', authMiddleware, async (c) => {
   });
 
   // Get status summary
-  const statusSummary = await getStatusSummary(c.env, domainId || undefined);
+  const statusSummary = await getStatusSummary(c.env, domainId || undefined, accessibleDomainIds);
 
   return c.json({
     success: true,
