@@ -123,12 +123,14 @@ export function parseUserAgent(userAgent: string): {
 } {
   const ua = userAgent.toLowerCase();
 
-  // Detect device type
+  // Detect device type — check tablet BEFORE mobile. Android tablets report
+  // 'android' WITHOUT 'mobile' in the UA, so they must be classified as tablet
+  // before the mobile branch (which also matches 'android') can claim them.
   let device_type: 'desktop' | 'mobile' | 'tablet' = 'desktop';
-  if (ua.includes('mobile') || ua.includes('android')) {
-    device_type = 'mobile';
-  } else if (ua.includes('tablet') || ua.includes('ipad')) {
+  if (ua.includes('ipad') || ua.includes('tablet') || (ua.includes('android') && !ua.includes('mobile'))) {
     device_type = 'tablet';
+  } else if (ua.includes('mobile') || ua.includes('android')) {
+    device_type = 'mobile';
   }
 
   // Detect browser
@@ -142,10 +144,10 @@ export function parseUserAgent(userAgent: string): {
   // Detect OS
   let os = 'unknown';
   if (ua.includes('windows')) os = 'windows';
+  else if (ua.includes('android')) os = 'android';
+  else if (ua.includes('iphone') || ua.includes('ipad') || ua.includes('ipod') || ua.includes('ios')) os = 'ios';
   else if (ua.includes('mac')) os = 'macos';
   else if (ua.includes('linux')) os = 'linux';
-  else if (ua.includes('android')) os = 'android';
-  else if (ua.includes('ios')) os = 'ios';
 
   return { device_type, browser, os };
 }
@@ -346,4 +348,3 @@ export function calculateGrowth(current: number, previous: number): {
 
   return { percentage: Math.round(percentage * 100) / 100, trend };
 }
-

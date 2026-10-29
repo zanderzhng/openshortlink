@@ -28,10 +28,19 @@ import { logAuditEvent, getIpAddress, getUserAgent } from '../services/audit';
 
 const usersRouter = new Hono<{ Bindings: Env; Variables: Variables }>();
 
+// Strip secret columns before returning a user in any API response.
+// password_hash / mfa_secret / mfa_backup_codes must never leave the server —
+// mfa_secret in particular would allow generating valid TOTP codes (MFA bypass).
+export function sanitizeUser(user: object): Record<string, unknown> {
+  const { password_hash, mfa_secret, mfa_backup_codes, ...safe } = user as Record<string, unknown>;
+  void password_hash; void mfa_secret; void mfa_backup_codes;
+  return safe;
+}
+
 // List all users (admin only)
 usersRouter.get('/', authMiddleware, requireRole(['admin', 'owner']), async (c) => {
   const users = await c.env.DB.prepare(
-    `SELECT id, email, username, role, global_access, created_at, updated_at, last_login_at 
+    `SELECT id, email, username, role, global_access, mfa_enabled, created_at, updated_at, last_login_at
      FROM users 
      ORDER BY created_at DESC`
   ).all<{
@@ -40,6 +49,7 @@ usersRouter.get('/', authMiddleware, requireRole(['admin', 'owner']), async (c) 
     username?: string;
     role: string;
     global_access: number;
+    mfa_enabled?: number;
     created_at: number;
     updated_at: number;
     last_login_at?: number;
@@ -67,6 +77,7 @@ usersRouter.get('/', authMiddleware, requireRole(['admin', 'owner']), async (c) 
     return {
       ...user,
       global_access: user.global_access === 1,
+      mfa_enabled: user.mfa_enabled === 1, // drives the dashboard's Reset MFA button
       domain_ids: userDomainIds,
     };
   });
@@ -76,7 +87,7 @@ usersRouter.get('/', authMiddleware, requireRole(['admin', 'owner']), async (c) 
 
 // Get user by ID (admin only)
 usersRouter.get('/:id', authMiddleware, requireRole(['admin', 'owner']), async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const user = await getUserById(c.env, id);
 
   if (!user) {
@@ -91,7 +102,7 @@ usersRouter.get('/:id', authMiddleware, requireRole(['admin', 'owner']), async (
   return c.json({
     success: true,
     data: {
-      ...user,
+      ...sanitizeUser(user),
       global_access: user.global_access === 1,
       domain_ids: userDomains.map(ud => ud.domain_id),
     },
@@ -153,6 +164,7 @@ usersRouter.post('/', authMiddleware, requireRole(['admin', 'owner']), validateJ
     password_hash: passwordHash,
     role: validated.role,
     global_access: globalAccess,
+    must_change_password: validated.must_change_password ? 1 : 0, // #11
   });
 
   // Set domain access if not global
@@ -182,7 +194,7 @@ usersRouter.post('/', authMiddleware, requireRole(['admin', 'owner']), validateJ
   return c.json({
     success: true,
     data: {
-      ...user,
+      ...sanitizeUser(user),
       global_access: globalAccess === 1,
       domain_ids: userDomains.map(ud => ud.domain_id),
     },
@@ -191,7 +203,7 @@ usersRouter.post('/', authMiddleware, requireRole(['admin', 'owner']), validateJ
 
 // Update user (admin only)
 usersRouter.put('/:id', authMiddleware, requireRole(['admin', 'owner']), validateJson(updateUserSchema), async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const validated = c.req.valid('json');
 
   const existingUser = await getUserById(c.env, id);
@@ -252,6 +264,11 @@ usersRouter.put('/:id', authMiddleware, requireRole(['admin', 'owner']), validat
   if (validated.preferences !== undefined) {
     updates.preferences = JSON.stringify(validated.preferences);
   }
+  if (validated.must_change_password !== undefined) {
+    // #11: admin can (re)require a forced password change
+    (updates as { must_change_password?: number }).must_change_password =
+      validated.must_change_password ? 1 : 0;
+  }
 
   // Update user
   const updatedUser = await updateUser(c.env, id, updates);
@@ -292,7 +309,7 @@ usersRouter.put('/:id', authMiddleware, requireRole(['admin', 'owner']), validat
   return c.json({
     success: true,
     data: {
-      ...updatedUser,
+      ...sanitizeUser(updatedUser),
       global_access: updatedUser.global_access === 1,
       domain_ids: userDomains.map(ud => ud.domain_id),
     },
@@ -302,7 +319,7 @@ usersRouter.put('/:id', authMiddleware, requireRole(['admin', 'owner']), validat
 // Set user's domain access (admin only)
 usersRouter.put('/:id/domains', authMiddleware, requireRole(['admin', 'owner']), validateJson(setUserDomainsSchema), async (c) => {
   try {
-    const id = c.req.param('id');
+    const id = c.req.param('id')!;
     const validated = c.req.valid('json');
 
     const user = await getUserById(c.env, id);
@@ -383,7 +400,7 @@ usersRouter.put('/:id/domains', authMiddleware, requireRole(['admin', 'owner']),
 
 // Get user's accessible domains (admin only)
 usersRouter.get('/:id/domains', authMiddleware, requireRole(['admin', 'owner']), async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const user = await getUserById(c.env, id);
 
   if (!user) {
@@ -407,7 +424,7 @@ usersRouter.get('/:id/domains', authMiddleware, requireRole(['admin', 'owner']),
 // Delete user (admin only) - moved from auth.ts
 usersRouter.delete('/:id', authMiddleware, requireRole(['admin', 'owner']), async (c) => {
   const currentUser = c.get('user') as { id: string; role: string };
-  const targetUserId = c.req.param('id');
+  const targetUserId = c.req.param('id')!;
 
   // Cannot delete yourself
   if (currentUser.id === targetUserId) {
@@ -448,6 +465,43 @@ usersRouter.delete('/:id', authMiddleware, requireRole(['admin', 'owner']), asyn
     success: true,
     message: 'User deleted successfully',
   });
+});
+
+// Reset a user's MFA (admin only). Recovery path when a user lost their authenticator,
+// or when SETUP_TOKEN changed and their encrypted MFA secret can no longer be read.
+// Not for your own account (use /auth/mfa/disable, which requires re-authentication);
+// only an owner can reset another owner's MFA.
+usersRouter.post('/:id/mfa/reset', authMiddleware, requireRole(['admin', 'owner']), async (c) => {
+  const currentUser = c.get('user') as { id: string; role: string };
+  const targetUserId = c.req.param('id')!;
+
+  if (currentUser.id === targetUserId) {
+    throw new HTTPException(400, { message: 'Use Settings → Disable MFA for your own account' });
+  }
+
+  const targetUser = await getUserById(c.env, targetUserId);
+  if (!targetUser) {
+    throw new HTTPException(404, { message: 'User not found' });
+  }
+  if (targetUser.role === 'owner' && currentUser.role !== 'owner') {
+    throw new HTTPException(403, { message: "Only an owner can reset an owner's MFA" });
+  }
+
+  await updateUser(c.env, targetUserId, {
+    mfa_enabled: 0,
+    mfa_secret: null,
+    mfa_backup_codes: null,
+  } as any);
+
+  await logAuditEvent(c.env, {
+    user_id: currentUser.id,
+    event_type: 'mfa_disabled',
+    ip_address: getIpAddress(c.req.raw),
+    user_agent: getUserAgent(c.req.raw),
+    details: { reset_by_admin: true, target_user_id: targetUserId, target_username: targetUser.username },
+  });
+
+  return c.json({ success: true, message: 'MFA reset. The user can sign in with their password and enrol MFA again.' });
 });
 
 export { usersRouter };

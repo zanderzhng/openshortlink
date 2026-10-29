@@ -28,6 +28,13 @@ export const darkModeCss = `/* Dark Mode Overrides */
   --sidebar-active: #818cf8;
   --warning-bg: #4a3e10;
   --warning-border: #d9a406;
+  /* Dark variants of the inline callout backgrounds (light values in base.css) */
+  --info-bg: #0c4a6e;
+  --success-bg: #14432a;
+  /* Light text/heading accents for callouts in dark mode */
+  --info-text: #bae6fd;
+  --warning-text: #fde68a;
+  --success-text: #86efac;
 }
 
 .dark-mode .json-key { color: #79c0ff; }
@@ -54,4 +61,17 @@ export const darkModeCss = `/* Dark Mode Overrides */
 .dark-mode .help-box strong, .dark-mode .help-box p { color: #cce5ff; }
 
 .dark-mode .tag-item-edit, .dark-mode .category-item-edit { background: #4a3e10; border-color: #d9a406; }
+
+/* Status/validation/generic badges: darker backgrounds with legible text on dark cards */
+.dark-mode .status-badge.status-active { background: #14432a; color: #86efac; }
+.dark-mode .status-badge.status-expired { background: #78350f; color: #fde68a; }
+.dark-mode .status-badge.status-archived { background: #1e3a5f; color: #93c5fd; }
+.dark-mode .status-badge.status-deleted { background: #4a1c1c; color: #fca5a5; }
+
+.dark-mode .validation-badge.badge-success { background: #14432a; color: #86efac; border-color: #2d5a2e; }
+.dark-mode .validation-badge.badge-error { background: #4a1c1c; color: #fca5a5; border-color: #6b2929; }
+.dark-mode .validation-badge.badge-secondary { background: #334155; color: #cbd5e1; border-color: #475569; }
+
+.dark-mode .badge.badge-success { background: #14432a; color: #86efac; }
+.dark-mode .badge.badge-secondary { background: #334155; color: #cbd5e1; }
 `;

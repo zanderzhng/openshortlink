@@ -10,18 +10,23 @@
 import type { Env, Link, CachedLink, Domain } from '../types';
 import { getCachedLink, setCachedLink } from './cache';
 import { getLinkBySlug, incrementClickCount } from '../db/links';
-import { getGeoRedirects, getDeviceRedirects } from '../db/linkRedirects';
+import { buildCachedLink } from './linkService';
 import { trackClick, parseUserAgent, extractUtmParams, hashIpAddress, formatDateForGrouping, extractReferrerDomain } from './analytics';
+import { isBot } from '../utils/bots';
+import { renderOgPreviewPage } from '../views/ogPreview';
+import { renderPixelInterstitial, pixelInterstitialCsp, isHttpUrl, generateNonce } from '../views/pixelInterstitial';
 
 /**
  * Merges query parameters from the request URL into the destination URL.
- * Request parameters override destination parameters if there are duplicates.
- * 
+ * Owner-configured destination parameters win: a request param is only copied
+ * over when the destination URL does NOT already define that key. This stops a
+ * visitor from overriding owner-set params (e.g. utm_source) via the query string.
+ *
  * @param destinationUrl - The destination URL to merge parameters into
  * @param requestUrl - The request URL containing parameters to merge
  * @returns The destination URL with merged query parameters
  */
-function mergeQueryParams(destinationUrl: string, requestUrl: URL): string {
+export function mergeQueryParams(destinationUrl: string, requestUrl: URL): string {
   try {
     // Parse the destination URL
     const destUrl = new URL(destinationUrl);
@@ -32,9 +37,12 @@ function mergeQueryParams(destinationUrl: string, requestUrl: URL): string {
       return destinationUrl;
     }
 
-    // Merge parameters: request parameters override destination parameters
+    // Merge parameters: only copy a request param when the destination does not
+    // already define that key, so owner-configured params are never overridden.
     requestParams.forEach((value, key) => {
-      destUrl.searchParams.set(key, value);
+      if (!destUrl.searchParams.has(key)) {
+        destUrl.searchParams.set(key, value);
+      }
     });
 
     return destUrl.toString();
@@ -51,7 +59,7 @@ export async function handleRedirect(
   request: Request,
   domain: Domain, // Accept domain object instead of just domain name
   slug: string,
-  executionCtx?: ExecutionContext,
+  executionCtx?: Pick<ExecutionContext, 'waitUntil'>,
   matchedRoute?: string // New optional parameter for strict routing
 ): Promise<Response> {
   // DEBUG: Log IMMEDIATELY at the very start - this should always appear
@@ -103,69 +111,12 @@ export async function handleRedirect(
       return new Response('Link is not available', { status: 403 });
     }
 
-    // For stale cache refresh, only fetch redirects if not already in cache
-    let geoRedirects: any[] = [];
-    let deviceRedirects: any[] = [];
-    
-    if (needsCacheRefresh && cached) {
-      // Patch mode: keep existing redirect data if present
-      if (cached.geo_redirects) {
-        // Convert object back to array for consistency
-        geoRedirects = Object.entries(cached.geo_redirects).map(([country_code, destination_url]) => ({
-          country_code,
-          destination_url
-        }));
-      }
-      if (cached.device_redirects) {
-        deviceRedirects = [
-          cached.device_redirects.desktop && { device_type: 'desktop', destination_url: cached.device_redirects.desktop },
-          cached.device_redirects.mobile && { device_type: 'mobile', destination_url: cached.device_redirects.mobile },
-          cached.device_redirects.tablet && { device_type: 'tablet', destination_url: cached.device_redirects.tablet },
-        ].filter(Boolean) as any[];
-      }
-      // DEBUG: console.log('[REDIRECT] Patching stale cache - reusing existing redirect data');
-    } else {
-      // Full refresh: fetch from DB
-      [geoRedirects, deviceRedirects] = await Promise.all([
-        getGeoRedirects(env, link.id),
-        getDeviceRedirects(env, link.id)
-      ]);
-    }
-
-    // Build complete cache object (with all required fields)
-    // Ensure link_id is always set (validated above, but double-check for safety)
-    const linkId = link.id;
-    if (!linkId) {
-      console.error('[REDIRECT] ❌ CRITICAL: link.id is missing after validation!', { domain: domain.domain_name, slug });
-      return new Response('Internal server error: Link data invalid', { status: 500 });
-    }
-
-    cached = {
-      destination_url: link.destination_url,
-      redirect_code: link.redirect_code,
-      status: link.status,
-      expires_at: link.expires_at,
-      password_hash: link.password_hash,
-      link_id: linkId, // Always include link_id (validated above)
-      geo_redirects:
-        geoRedirects.length > 0
-          ? Object.fromEntries(geoRedirects.map((r: any) => [r.country_code, r.destination_url]))
-          : undefined,
-      device_redirects:
-        deviceRedirects.length > 0
-          ? {
-            desktop: deviceRedirects.find((r: any) => r.device_type === 'desktop')?.destination_url,
-            mobile: deviceRedirects.find((r: any) => r.device_type === 'mobile')?.destination_url,
-            tablet: deviceRedirects.find((r: any) => r.device_type === 'tablet')?.destination_url,
-          }
-          : undefined,
-      route: link.metadata ? (() => {
-        try { return JSON.parse(link.metadata).route; } catch { return undefined; }
-      })() : undefined,
-      domain_routing_path: domain.routing_path,
-    };
+    // Always rebuild from the DB via the shared builder. We deliberately do NOT reuse
+    // data from a stale cache entry (it may predate newer per-link features), and we do
+    // NOT hand-build the object here: a second copy of the builder already drifted once
+    // (og_meta was missing from it, so previews vanished after a cache eviction).
+    cached = await buildCachedLink(env, link, domain);
     await setCachedLink(env, domain.domain_name, slug, cached);
-    // DEBUG: console.log('[REDIRECT] Cache updated with all required fields, link_id:', linkId);
   }
 
   // Check if link is expired (from cache)
@@ -173,6 +124,13 @@ export async function handleRedirect(
   // We need to compare seconds with seconds
   if (cached.expires_at && cached.expires_at < Math.floor(Date.now() / 1000)) {
     return new Response('Link has expired', { status: 410 });
+  }
+
+  // Check link status (from cache) — a disabled/archived link may still be cached
+  // (the cache entry is rewritten, not deleted, on a status-changing PUT). Mirror the
+  // cache-MISS path so non-active links stop redirecting instead of serving forever.
+  if (cached.status !== 'active') {
+    return new Response('Link is not available', { status: 403 });
   }
 
   // Strict Routing Check (performed AFTER cache retrieval to ensure it applies to cached links too)
@@ -208,6 +166,30 @@ export async function handleRedirect(
         }
       }
     }
+  }
+
+  // Social crawler + OG meta configured -> serve a rich preview page instead of a bare
+  // redirect. Done BEFORE click tracking + destination resolution so that crawler
+  // preview fetches (often several per social share) are NOT counted as clicks.
+  // Humans, and crawlers on links without og_meta, fall through to the normal redirect.
+  const ogUserAgent = request.headers.get('user-agent') || '';
+  if (cached.og_meta && isBot(ogUserAgent)) {
+    // og:url is the SHORT link itself (query stripped) so the preview is attributed
+    // to the short URL, not the destination — and the page does NOT auto-redirect,
+    // so scrapers read our tags instead of following through to the destination.
+    const shortUrl = new URL(request.url);
+    shortUrl.search = '';
+    return new Response(renderOgPreviewPage(cached.og_meta, shortUrl.toString()), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        // The 200-preview-vs-301-redirect choice depends on the User-Agent (bot check),
+        // so shared caches MUST key on it — otherwise a cached preview could be served
+        // to a human, or a cached redirect to a crawler (cache poisoning).
+        'Cache-Control': 'public, max-age=300',
+        'Vary': 'User-Agent',
+      },
+    });
   }
 
   // Resolve destination URL based on geo/device
@@ -259,6 +241,26 @@ export async function handleRedirect(
 
   // DEBUG: console.log('[REDIRECT] Returning redirect response to:', finalDestinationUrl);
 
+  // Pixels configured + a real human -> serve an interstitial that fires the pixels, then
+  // JS-redirects. Bots skip it (no point firing pixels for a crawler). Only for http(s)
+  // destinations: z.string().url() accepts javascript:/data:, which a 301 Location never
+  // executes but location.replace() would — on this (possibly dashboard-shared) origin.
+  if (cached.pixels && cached.pixels.length > 0 && !isBot(ogUserAgent) && isHttpUrl(finalDestinationUrl)) {
+    const nonce = generateNonce();
+    return new Response(renderPixelInterstitial(cached.pixels, finalDestinationUrl, nonce), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        // Per-visitor page; never cache it anywhere.
+        'Cache-Control': 'private, no-store, max-age=0',
+        // Own CSP: the default one (script-src 'self', connect-src 'self') would block the
+        // pixel loaders and beacons. securityHeaders keeps a CSP the response already set.
+        'Content-Security-Policy': pixelInterstitialCsp(nonce),
+        'Vary': 'User-Agent',
+      },
+    });
+  }
+
   // Create redirect response with cache control headers
   // We need to create a new Response because Response.redirect() returns an immutable response
   const redirectCode = cached.redirect_code as 301 | 302 | 307 | 308;
@@ -267,10 +269,25 @@ export async function handleRedirect(
   // 301/308 are permanent → cache long (1 year)
   // 302/307 are temporary → cache short (1 hour)
   const isPermanent = redirectCode === 301 || redirectCode === 308;
-  const cacheMaxAge = isPermanent ? 31536000 : 3600; // 1 year for permanent, 1 hour for temporary
-  const cacheControl = isPermanent
-    ? `public, max-age=${cacheMaxAge}, immutable`
-    : `public, max-age=${cacheMaxAge}`;
+  // Links that carry ANY per-visitor redirect rule (geo/city/os/device) must not be
+  // frozen in the browser for a year: a rule/destination edit would never reach a
+  // returning visitor, and the same cached Location could be replayed regardless of
+  // the visitor's new geo/device. Cap those to a short max-age and drop `immutable`
+  // so edits propagate. Rule-free links keep the long permanent-redirect cache.
+  const hasRules = !!(cached.geo_redirects || cached.city_redirects || cached.os_redirects || cached.device_redirects);
+  const cacheMaxAge = isPermanent
+    ? (hasRules ? 300 : 31536000) // 5 min for rule-bearing permanent redirects, else 1 year
+    : 3600; // 1 hour for temporary
+  // Geo (country) and city redirects are resolved from request.cf, which cannot
+  // participate in a Vary header — so a shared cache could replay one visitor's
+  // geo-specific destination to visitors elsewhere. Mark those responses `private`
+  // (browser-only). Device/OS redirects vary on User-Agent (which IS Vary-able),
+  // so they can safely remain `public`.
+  const geoVariant = !!(cached.geo_redirects || cached.city_redirects);
+  const cacheScope = geoVariant ? 'private' : 'public';
+  const cacheControl = (isPermanent && !hasRules)
+    ? `${cacheScope}, max-age=${cacheMaxAge}, immutable`
+    : `${cacheScope}, max-age=${cacheMaxAge}`;
 
   // Build headers
   const headers: HeadersInit = {
@@ -279,8 +296,9 @@ export async function handleRedirect(
   };
 
   // Add Vary header if geo/device redirects exist (different users get different destinations)
-  if (cached.geo_redirects || cached.device_redirects) {
-    headers['Vary'] = 'Accept-Language, CF-IPCountry, User-Agent';
+  const varyHeader = buildVaryHeader(cached);
+  if (varyHeader) {
+    headers['Vary'] = varyHeader;
   }
 
   return new Response(null, {
@@ -290,28 +308,87 @@ export async function handleRedirect(
 }
 
 /**
- * Resolves the destination URL based on geo and device redirects.
- * Priority: Geo redirect > Device redirect > Default URL
+ * Extracts geo (country/city) for the visitor from the request.
+ *
+ * `request.cf` is populated by Cloudflare by default; the `cf-*` headers require
+ * the "visitor location headers" Managed Transform, so we fall back to them.
+ * Returns raw values (no case normalization) so analytics keeps original casing;
+ * callers that match against rules normalize as needed.
  */
-function resolveDestinationUrl(cached: CachedLink, request: Request): string {
-  // Extract country from Cloudflare headers
-  const country = (request.headers.get('cf-ipcountry') || '').toUpperCase();
+export function extractGeoFromRequest(request: Request): { country: string; city: string } {
+  const cf = (request as { cf?: { city?: string; country?: string } }).cf;
+  const country = cf?.country || request.headers.get('cf-ipcountry') || '';
+  const city = cf?.city || request.headers.get('cf-ipcity') || '';
+  return { country, city };
+}
 
-  // Extract device type from user-agent
+/**
+ * Builds the Vary header value for a cached link, or undefined when no
+ * location/device-dependent redirects exist. City redirects additionally
+ * vary on CF-IPCity so cities don't share each other's cached destination.
+ */
+export function buildVaryHeader(cached: CachedLink): string | undefined {
+  // og_meta / pixels included: crawlers and humans get different responses (200 preview vs
+  // 301, or 301 vs 200 interstitial), so the redirect must vary on User-Agent to keep shared
+  // caches from crossing them.
+  if (!(cached.geo_redirects || cached.device_redirects || cached.city_redirects || cached.os_redirects || cached.og_meta || cached.pixels)) {
+    return undefined;
+  }
+  const varyValues = ['Accept-Language', 'CF-IPCountry', 'User-Agent'];
+  if (cached.city_redirects) {
+    varyValues.push('CF-IPCity');
+  }
+  return varyValues.join(', ');
+}
+
+/**
+ * Resolves the destination URL based on geo and device redirects.
+ * Priority: City > Country > OS > Device > Default URL
+ */
+export function resolveDestinationUrl(cached: CachedLink, request: Request): string {
+  // For RULE MATCHING trust ONLY Cloudflare-populated request.cf values — never the
+  // client-supplied cf-ipcountry/cf-ipcity headers (which a visitor can forge to pick
+  // which destination they are served). The header fallback in extractGeoFromRequest
+  // stays for analytics logging only.
+  const cf = (request as { cf?: { city?: string; country?: string } }).cf;
+  const country = (cf?.country || '').toUpperCase();
+  const city = (cf?.city || '').toLowerCase();
+
+  // Extract device type and OS from user-agent
   const userAgent = request.headers.get('user-agent') || '';
-  const { device_type } = parseUserAgent(userAgent);
+  const { device_type, os } = parseUserAgent(userAgent);
 
-  // Priority 1: Geo redirect
+  // Priority 1: City redirect (exact match, case-insensitive)
+  if (cached.city_redirects && city) {
+    for (const rule of cached.city_redirects) {
+      if (city === rule.city_name.toLowerCase()) {
+        return rule.destination_url;
+      }
+    }
+  }
+
+  // Priority 2: Geo (Country) redirect
   if (cached.geo_redirects && country && cached.geo_redirects[country]) {
     return cached.geo_redirects[country];
   }
 
-  // Priority 2: Device redirect
+  // Priority 3: OS redirect
+  // Map detected OS to 'android' or 'ios' keys
+  if (cached.os_redirects) {
+    if (os === 'android' && cached.os_redirects.android) {
+      return cached.os_redirects.android;
+    }
+    if (os === 'ios' && cached.os_redirects.ios) {
+      return cached.os_redirects.ios;
+    }
+  }
+
+  // Priority 4: Device redirect
   if (cached.device_redirects && cached.device_redirects[device_type]) {
     return cached.device_redirects[device_type];
   }
 
-  // Priority 3: Default URL
+  // Priority 5: Default URL
   return cached.destination_url;
 }
 
@@ -329,9 +406,18 @@ async function trackClickAsync(
     // Extract metadata from request
     const url = new URL(request.url);
     const userAgent = request.headers.get('user-agent') || '';
+
+    // Bots/crawlers must not count as clicks. trackClick already drops bots from
+    // Analytics Engine, but incrementClickCount would still bump links.click_count —
+    // gate the whole tracking path so the dashboard count matches analytics.
+    if (isBot(userAgent)) {
+      return;
+    }
+
     const referrer = request.headers.get('referer') || request.headers.get('referrer') || '';
-    const cfCountry = request.headers.get('cf-ipcountry') || 'unknown';
-    const cfCity = request.headers.get('cf-ipcity') || 'unknown';
+    const geo = extractGeoFromRequest(request);
+    const cfCountry = geo.country || 'unknown';
+    const cfCity = geo.city || 'unknown';
     const ipAddress = request.headers.get('cf-connecting-ip') || 'unknown';
 
     const { device_type, browser, os } = parseUserAgent(userAgent);
@@ -347,37 +433,39 @@ async function trackClickAsync(
     const referrerDomain = extractReferrerDomain(referrer);
 
     // Track click to Analytics Engine only
-    // Aggregation to D1 happens in background scheduled job for data ≥ 90 days old
-    await trackClick(env, {
-      timestamp,
-      link_id: linkId,
-      domain,
-      slug,
-      destination_url: destinationUrl,
-      country: cfCountry,
-      city: cfCity,
-      user_agent: userAgent,
-      referrer,
-      ip_address: hashedIp,
-      device_type,
-      browser,
-      os,
-      utm_source,
-      utm_medium,
-      utm_campaign,
-      gclid,
-      fbclid,
-      msclkid,
-      ttclid,
-      li_fat_id,
-      twclid,
-      custom_param1,
-      custom_param2,
-      custom_param3,
-    });
-
-    // Increment click count (async)
-    await incrementClickCount(env, linkId);
+    // Aggregation to D1 happens in background scheduled job for data ≥ 90 days old.
+    // trackClick and incrementClickCount are independent — run them concurrently.
+    await Promise.all([
+      trackClick(env, {
+        timestamp,
+        link_id: linkId,
+        domain,
+        slug,
+        destination_url: destinationUrl,
+        country: cfCountry,
+        city: cfCity,
+        user_agent: userAgent,
+        referrer,
+        ip_address: hashedIp,
+        device_type,
+        browser,
+        os,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        gclid,
+        fbclid,
+        msclkid,
+        ttclid,
+        li_fat_id,
+        twclid,
+        custom_param1,
+        custom_param2,
+        custom_param3,
+      }),
+      // Increment click count (async)
+      incrementClickCount(env, linkId),
+    ]);
   } catch (error) {
     // Enhanced error logging with full context
     const errorDetails = {

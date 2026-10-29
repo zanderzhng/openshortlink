@@ -96,7 +96,7 @@ apiKeysRouter.get('/', authMiddleware, requireRole(['admin', 'owner']), async (c
 
 // Get API key by ID (admin only)
 apiKeysRouter.get('/:id', authMiddleware, requireRole(['admin', 'owner']), async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const apiKey = await getApiKeyById(c.env, id);
 
   if (!apiKey) {
@@ -187,7 +187,7 @@ apiKeysRouter.post('/', authMiddleware, requireRole(['admin', 'owner']), validat
 
 // Update API key (admin only)
 apiKeysRouter.put('/:id', authMiddleware, requireRole(['admin', 'owner']), validateJson(updateApiKeySchema), async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const validated = c.req.valid('json');
 
   const existingKey = await getApiKeyById(c.env, id);
@@ -263,7 +263,7 @@ apiKeysRouter.put('/:id', authMiddleware, requireRole(['admin', 'owner']), valid
 
 // Revoke API key (admin only)
 apiKeysRouter.delete('/:id', authMiddleware, requireRole(['admin', 'owner']), async (c) => {
-  const id = c.req.param('id');
+  const id = c.req.param('id')!;
   const hardDelete = c.req.query('hard') === 'true';
 
   const existingKey = await getApiKeyById(c.env, id);

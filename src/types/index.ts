@@ -7,6 +7,8 @@
 
 // Core types for the openshortlink platform
 
+import type { PixelType } from '../utils/pixelIds';
+
 export interface Link {
   id: string;
   domain_id: string;
@@ -27,6 +29,9 @@ export interface Link {
   created_by?: string;
   tags?: Tag[];
   category?: Category;
+  // Joined columns (present when fetched via a JOIN on domains)
+  domain_name?: string;
+  routing_path?: string;
 }
 
 export interface Domain {
@@ -90,6 +95,7 @@ export interface User {
   // Multi-user system
   global_access?: number; // 0 or 1 (SQLite boolean) - 1 = access to all domains
   permission_version?: number; // Incremented when domain access changes (for cache invalidation)
+  must_change_password?: number; // 0 or 1 (SQLite boolean) - 1 = force password change on next login (#11)
 }
 
 export interface UserDomain {
@@ -201,6 +207,25 @@ export interface CachedLink {
     mobile?: string;
     tablet?: string;
   };
+  city_redirects?: Array<{
+    city_name: string;
+    destination_url: string;
+  }>;
+  os_redirects?: {
+    android?: string;
+    ios?: string;
+  };
+  og_meta?: {
+    og_title?: string;
+    og_description?: string;
+    og_image?: string;
+    og_type: string;
+    twitter_card: string;
+  };
+  pixels?: Array<{
+    pixel_type: PixelType;
+    pixel_id: string;
+  }>;
   route?: string; // The specific route this link is assigned to (for strict routing)
   domain_routing_path?: string; // The domain's default routing path (for legacy strict routing check)
 }
